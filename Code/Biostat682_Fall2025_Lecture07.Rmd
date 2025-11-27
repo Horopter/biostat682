@@ -1,0 +1,782 @@
+---
+title: "Bayesian Linear Regression with Basic MCMC"
+author: "Jian Kang"
+date: "2025-09-29"
+output: 
+  html_document:
+    mathjax: "default"
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 3
+    number_sections: true
+    theme: lumen
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+This document illustrates how to derive and implement basic Markov chain Monte Carlo (MCMC) algorithms to make Bayesian inference on a simple linear regression model with two predictors. We will cover the following topics:
+
+* Metropolis (Random Walk)
+* Gibbs sampler
+* blocked Gibbs sampler
+
+
+# A Bayesian linear regression model
+
+## A Motivating Problem 
+A medical researcher is conducting a comprehensive study to identify factors that influence the **length of hospital stay** (in days) after **total knee arthroplasty** (knee replacement surgery). Total knee arthroplasty is a widely performed surgical procedure aimed at relieving pain and restoring function in patients suffering from severe knee arthritis or injury. The duration of hospitalization post-surgery is a critical metric, as it affects patient recovery, hospital resource utilization, and overall healthcare costs.
+
+The primary goal of this research is to examine the impact of two potential predictors on the length of hospital stay:
+
+* **Age of the Patient**: Age is a well-recognized factor in medical outcomes. Older patients may experience slower recovery rates due to age-related physiological changes, comorbidities, or decreased mobility. Understanding how age affects hospital stay can help in tailoring postoperative care plans for different age groups.
+
+* **Working Years**: This refers to the number of years the patient has been employed during their lifetime. Working years may capture aspects of a patient's lifestyle, such as physical activity levels, occupational stress, and socioeconomic status. While it is often correlated with age, it doesn't necessarily have a direct causal effect on recovery. Investigating this factor can reveal whether work-related factors contribute to postoperative recovery independent of age. 
+
+## Obseved Data
+We collect data from $n = 202$ patients. We introcue the following notation for data, for $i = 1,\ldots, n$, 
+
+* $Y_i$: the length of hospital stay for patient $i$ (in days)
+* $X_{1i}$: the age of patient $i$ (in years)
+* $X_{2i}$: the number of years that patient $i$ has been working.  
+
+For a better interpretation, we compute the summary statistics $X^*_1 = \mathrm{Med}(X_{1i})$ and $X^*_2 = \mathrm{Med}(X_{2i})$ which represent 
+the median age and median number of working years respectively. 
+
+Read data
+```{r}
+projpath = "/Users/jiankang/University of Michigan Dropbox/Jian Kang/Umich/Biostat682/Fall2025/data/"
+dat <- read.csv(file=file.path(projpath,"hospital_stay_data.csv"))
+print(head(dat))
+```
+
+Visualization of data
+```{r}
+library(ggplot2)
+library(gridExtra)
+p1 <- ggplot(dat,aes(x=age,y=hospital_stay)) +
+         geom_point() + ggtitle("Age verus Hospital Stay") + theme_minimal()
+p2 <- ggplot(dat,aes(x=work_years,y=hospital_stay)) +
+         geom_point() + ggtitle("Work Years verus Hospital Stay") + theme_minimal()
+p3 <- ggplot(dat,aes(x=age,y=work_years)) +
+         geom_point() + ggtitle("Age verus Work Years") + theme_minimal()
+p4 <- ggplot(dat,aes(x=hospital_stay)) + geom_histogram(bins=8) + 
+  ggtitle("Hosptial Stay") + theme_minimal()
+
+grid.arrange(p1,p2,p3,p4,nrow=2,ncol=2)
+```
+
+
+## The Model
+We consider the Bayesian linear regression model
+
+$$Y_i = \beta_0 + \beta_1 (X_{1i} - X^*_1) + \beta_2 (X_{2i} - X^*_2) + \epsilon_i, \quad \epsilon_i\sim \mathrm{N}(0,\sigma^2)$$
+
+where $\epsilon_i$ represents the random noise and assumed to be independently and identically distributed as normal distribution with mean zero and variance $\sigma^{2}$. The unknown parameters include $\beta_0$, $\beta_1$, $\beta_2$ and $\sigma^{-2}$ where 
+
+* $\beta_0$: the expected length of hospital stay for a patient with a median Age and a median working years
+
+* $\beta_1$: the expected change in the length of hospital stay for one-year increase in age holding the working years constant
+
+* $\beta_2$: the expected change in the length of hospital stay for one-year increase in working years holding age constant. 
+
+* $\sigma^{-2}$: is the precision of the random noise. 
+
+
+## Prior specification
+We consider the following prior specifications: for $j = 0, 1, 2$, 
+$$ \beta_j \sim \mathrm{N}(0,\tau_j^2),\quad \tau_j^{-2} \sim \mathrm{G}(a_\tau, b_\tau)$$
+and
+$$\sigma^{-2} \sim \mathrm{G}(a_\sigma, b_\sigma)$$
+
+
+# Posterior inference via MCMC
+In this section, we will show how to derive the basic MCMC algorithms. 
+
+## Preprocess data
+```{r}
+preprocess_mat_data <- function(dat){
+  mat_dat <- list()
+  mat_dat$Y <- dat$hospital_stay
+  mat_dat$Z <- cbind(1, dat$age - median(dat$age),dat$work_years - median(dat$work_years))
+  mat_dat$n <- length(mat_dat$Y)
+  mat_dat$ZtZ <- crossprod(mat_dat$Z)
+  mat_dat$ZtY <- crossprod(mat_dat$Z,mat_dat$Y)
+  return(mat_dat)
+}
+
+
+mat_dat <- preprocess_mat_data(dat)
+```
+## Random Walk
+
+This code demonstrates a Metropolis algorithm for Bayesian linear regression. The algorithm uses a random walk proposal to sample from the posterior distribution of the parameters.
+
+### Log Posterior Density
+
+We first compute the log posterior density, which combines the log-likelihood and log-prior terms:
+
+```{r}
+log_post_density <- function(mat_dat, paras){
+  # Log likelihood: calculates log density of Y given current parameter values
+  log_lik_vec <- dnorm(mat_dat$Y, mean= mat_dat$Z %*% paras$beta, sd=1/sqrt(paras$inv_sigma_sq), log=TRUE)
+  
+  # Prior for beta: assumes a normal prior with mean zero and variance based on inv_sigma_sq
+  log_prior_beta <- dnorm(paras$beta, mean=0, sd=1/sqrt(paras$inv_sigma_sq), log=TRUE)
+  
+  # Prior for inv_tau_sq and inv_sigma_sq: both follow gamma distributions with specified shapes and rates
+  log_prior_tau <- dgamma(paras$inv_tau_sq, shape=paras$a_tau, rate=paras$b_tau)
+  log_prior_sigma <- dgamma(paras$inv_sigma_sq, shape=paras$a_sigma, rate=paras$b_sigma)
+  
+  # Sum up the log-likelihood and log-prior terms for the posterior
+  log_post <- sum(log_lik_vec) + sum(log_prior_beta) + sum(log_prior_tau) + sum(log_prior_sigma)
+  
+  return(log_post)
+}
+```
+
+
+### One-Step Random Walk
+
+The function **one_step_random_walk** performs a single step of the Metropolis algorithm. It proposes new values for the parameters and decides whether to accept the proposed values.
+
+```{r}
+one_step_random_walk <- function(mat_dat, paras, log_post, prop_sd){
+  # Start with current parameter values
+  paras_star <- paras 
+  
+  # Propose new values by adding normally distributed random steps (random walk)
+  paras_star$beta <- paras$beta + rnorm(length(paras$beta), sd=prop_sd[grep("beta", names(prop_sd))])
+  paras_star$inv_sigma_sq <- paras$inv_sigma_sq + rnorm(1, sd=prop_sd["inv_sigma_sq"])
+  paras_star$inv_tau_sq <- paras$inv_tau_sq + rnorm(length(paras$inv_tau_sq), sd=prop_sd[grep("inv_tau_sq", names(prop_sd))])
+  
+  accept <- 0  # Variable to track acceptance
+  
+  # Only proceed if proposed values for inv_sigma_sq and inv_tau_sq are positive
+  if(paras_star$inv_sigma_sq > 0 && all(paras_star$inv_tau_sq > 0)){
+    # Compute log posterior for the proposed parameters
+    log_post_star <- log_post_density(mat_dat, paras_star)
+    
+    # Metropolis acceptance rule: if the new log posterior is higher or with some probability if lower
+    if(log(runif(1)) < log_post_star - log_post){
+      paras <- paras_star  # Accept the proposal
+      log_post <- log_post_star
+      accept <- 1
+    }
+  }
+  
+  return(list(paras=paras, log_post=log_post, accept=accept))
+}
+```
+
+This function:
+
+* Creates a proposal paras_star by adding small random changes to each parameter.
+* Checks if the proposed values for inv\_sigma\_sq and inv\_tau\_sq are valid (positive).
+* Calculates the posterior density for the proposal and accepts it with a probability proportional to the posterior increase.
+
+### Full Random Walk MCMC
+
+The function **LM_random_walk** executes the Metropolis algorithm for a specified number of iterations. It keeps track of the accepted samples and calculates the acceptance rate periodically.
+
+```{r}
+library(coda)
+LM_random_walk <- function(mat_dat, paras, controls, prop_sd = c(beta = 0.1, inv_sigma_sq = 1, inv_tau_sq = 0.01), ar_step = 50){
+  
+  # Initial settings and MCMC sample matrix initialization
+  paras0 = paras
+  total_iters = controls$burn_in + controls$mcmc_sample * controls$thinning
+  
+  mcmc <- list(
+    beta = matrix(NA, ncol=3, nrow=controls$mcmc_sample),
+    inv_sigma_sq = matrix(NA, ncol=1, nrow=controls$mcmc_sample),
+    inv_tau_sq = matrix(NA, ncol=3, nrow=controls$mcmc_sample)
+  )
+  
+  colnames(mcmc$beta) = paste0("beta",0:2)
+  colnames(mcmc$inv_tau_sq) = paste0("inv_tau_sq",0:2)
+  colnames(mcmc$inv_sigma_sq) = "inv_sigma_sq"
+  
+  if(!is.null(controls$seed)) set.seed(controls$seed)  # Set seed for reproducibility
+  
+  k = 1  # Sample index for storing MCMC samples
+  
+  # Store initial values if no burn-in
+  if(controls$burn_in == 0){
+    mcmc$beta[k,] <- paras$beta
+    mcmc$inv_sigma_sq[k] <- paras$inv_sigma_sq
+    mcmc$inv_tau_sq[k,] <- paras$inv_tau_sq 
+    k = k + 1
+  }
+  
+  one_step <- list(log_post = log_post_density(mat_dat, paras), paras = paras)
+  
+  accept_rate <- vector()  # Vector to store acceptance rates
+  accept_count <- 0  # Counter for accepted steps
+  
+  # Main MCMC loop
+  for(iter in 2:total_iters){
+    one_step <- one_step_random_walk(mat_dat, one_step$paras, one_step$log_post, prop_sd)
+    accept_count <- accept_count + one_step$accept
+    
+    # Every ar_step iterations, calculate and store acceptance rate
+    if(iter %% ar_step == 0){
+      accept_rate[paste(iter)] <- accept_count / ar_step
+      accept_count <- 0
+    }
+    
+    # Store samples after burn-in period and according to thinning
+    if(iter > controls$burn_in){
+      if((iter - controls$burn_in) %% controls$thinning == 0){
+        mcmc$beta[k,] <- one_step$paras$beta
+        mcmc$inv_sigma_sq[k] <- one_step$paras$inv_sigma_sq
+        mcmc$inv_tau_sq[k,] <- one_step$paras$inv_tau_sq 
+        k = k + 1  
+      }
+    }
+  }
+  
+  # Post-process MCMC samples using the `mcmc` function from the `coda` package (optional)
+  mcmc$beta <- mcmc(mcmc$beta, start=controls$burn_in+1, end=total_iters, thin=controls$thinning)
+  mcmc$inv_tau_sq <- mcmc(mcmc$inv_tau_sq, start=controls$burn_in+1, end=total_iters, thin=controls$thinning)
+  mcmc$inv_sigma_sq <- mcmc(mcmc$inv_sigma_sq, start=controls$burn_in+1, end=total_iters, thin=controls$thinning)
+  
+  # Return MCMC samples and final acceptance rate
+  return(list(mcmc=mcmc, paras_initial = paras0, paras_last = paras, controls = controls, accept_rate = accept_rate))
+}
+```
+
+In this code:
+
+* total_iters defines the number of total iterations, combining burn-in and actual MCMC samples.
+* For each iteration, one_step_random_walk generates a new proposal and may accept it, updating accept_count accordingly.
+* After burn-in, samples are stored at intervals defined by the thinning parameter to avoid autocorrelation.
+* Acceptance rates are calculated every ar_step steps.
+
+### Example Run
+
+This block initializes the parameters, controls, and proposal standard deviations, then runs the MCMC algorithm. The final acceptance rate is printed.
+
+```{r}
+
+paras <- list(beta = c(1,1,1),
+              inv_tau_sq = c(0.01,0.01,0.01),
+              inv_sigma_sq = 0.001,
+              a_tau = 0.001,
+              b_tau = 0.001,
+              a_sigma = 0.001,
+              b_sigma = 0.001)
+
+controls <- list(mcmc_sample = 500,
+                 burn_in = 500,
+                 thinning = 1,
+                 seed = 2024)
+
+
+prop_sd <- c(beta = c(0.1, 0.1, 0.1), inv_sigma_sq = 0.1, inv_tau_sq  = 0.1)
+
+random_walk_res <- LM_random_walk(mat_dat, paras, controls, prop_sd = prop_sd, ar_step = 50)
+print(random_walk_res$accept_rate)
+```
+
+This final code:
+
+Runs the MCMC simulation and displays the acceptance rate.
+
+## Gibbs sampler
+To ease the derivation of Gibbs sampler, we introduce the following variables and summarize statistics directly from data 
+
+* $Z_{1i} = X_{1i} - X^*_1$ and $Z_{2i} = X_{2i} - X^*_2$ 
+
+* $\bar Z_{1} = n^{-1}\sum_{i=1}^n Z_{1i}$ and $\bar Z_2 = n^{-1}\sum_{i=1}^n Z_{2i}$
+
+* $\bar Z_{12} = n^{-1}\sum_{i=1}^n Z_{1i} Z_{2i}$
+
+* $\bar Z_{s,1} = n^{-1}\sum_{i=1}^n Z^2_{1i}$ and $\bar Z_{s,2} = n^{-1}\sum_{i=1}^n Z^2_{1i}$
+
+* $\bar Y = n^{-1}\sum_{i=1}^n Y_i$, $\bar Y_s = n^{-1}\sum_{i=1}^n Y^2_{i}$, $\bar Y_{z,2} = n^{-1}\sum_{i=1}^n Y_i Z_{2i}$ and $\bar Y_{z,2} = n^{-1}\sum_{i=1}^n Y_i Z_{2i}$.
+
+
+We first define the data and parameters
+```{r }
+preprocess_data <- function(dat){
+  clean_dat <- list()
+  clean_dat$Y <- dat$hospital_stay
+  clean_dat$Z1 <- dat$age - median(dat$age)
+  clean_dat$Z2 <- dat$work_years - median(dat$work_years)
+  clean_dat$Zbar <-c(1, mean(clean_dat$Z1), mean(clean_dat$Z2))
+  clean_dat$Zsqbar <-c(1, mean(clean_dat$Z1^2),mean(clean_dat$Z2^2))
+  clean_dat$Z12bar <- mean(clean_dat$Z1*clean_dat$Z2)
+  clean_dat$YZbar <- c(mean(clean_dat$Y),mean(clean_dat$Y*clean_dat$Z1),mean(clean_dat$Y*clean_dat$Z2))
+  clean_dat$n <- length(clean_dat$Y)
+  return(clean_dat)
+}
+
+clean_dat <- preprocess_data(dat)
+
+```
+### Derviations
+To implement Gibbs sampler we need to figure out the full conditional distribution of each unknown parameters. 
+
+We first write the joint posterior distribution 
+
+\begin{align}
+&\pi(\beta_0,\beta_1,\beta_2,\sigma^{-2} \mid \mathrm{Data})\\ \propto &
+\prod_{i=1}^n \pi(Y_i\mid X_{1i},X_{2i},\beta_0, \beta_1, \beta_2,\sigma^{-2})\pi(\sigma^{-2}) \prod_{j=0}^2\pi(\beta_j\mid \tau^{-2}_j) \pi(\tau^{-2}_j)\\
+\propto & (\sigma^{-2})^{n/2}\exp\left(-\frac{\sigma^{-2}}{2}\sum_{i=1}^n (Y_i - \beta_0 - \beta_1 Z_{i1}  -\beta_2 Z_{i2})^2\right) \times (\sigma^{-2})^{a_\sigma - 1} \exp(-b_\sigma \sigma^{-2}) \times \prod_{j=0}^2 (\tau^{-2}_j)^{1/2}\exp\left(-\frac{\tau^{-2}_j\beta_j^2}{2}\right) (\tau^{-2}_j)^{a_\tau - 1} \exp(-b_\tau \tau^{-2}_j)
+\end{align}
+
+The full conditional distribution for $\beta_0$ is 
+
+\begin{align}
+\pi(\beta_0 \mid \mathrm{rest}) &\propto \exp\left(-\frac{\sigma^{-2}}{2}\sum_{i=1}^n (Y_i - \beta_0 - \beta_1 Z_{i1}  -\beta_2 Z_{i2})^2\right) \exp\left(-\frac{\tau^{-2}_0\beta_0^2}{2}\right)\\
+&\propto \exp\left(-\frac{\sigma^{-2}}{2}\sum_{i=1}^n (\upsilon_{0i} - \beta_0)^2\right) \exp\left(-\frac{\tau^{-2}_0\beta_0^2}{2}\right)\\
+&\propto \exp\left(-\frac{1}{2}(n\sigma^{-2} + \tau^{-2}_0)\beta^2_0 + (n \sigma^{-2} \bar \upsilon_{0} \beta_0)\right)
+\end{align}
+
+This implies that 
+$$\beta_0 \mid \mathrm{rest} \sim \mathrm{N}\left(\frac{n\sigma^{-2} \bar\upsilon_0}{n\sigma^{-2}+\tau^{-2}_0},\frac{1}{n\sigma^{-2}+\tau^{-2}_0}\right)$$
+where $\bar\upsilon_0 = n^{-1} \sum_{i=1}^n (Y_i - \beta_1 Z_{1i} - \beta_2 Z_{2i})$.
+
+
+The full conditional distribution for $\beta_1$ is
+
+\begin{align}
+\pi(\beta_1 \mid \mathrm{rest}) &\propto \exp\left(-\frac{\sigma^{-2}}{2}\sum_{i=1}^n (Y_i - \beta_0 - \beta_1 Z_{i1}  -\beta_2 Z_{i2})^2\right) \exp\left(-\frac{\tau^{-2}_1\beta_1^2}{2}\right)\\
+&\propto \exp\left(-\frac{\sigma^{-2}}{2}\sum_{i=1}^n (\upsilon_{1i} - Z_{1i}\beta_1)^2\right) \exp\left(-\frac{\tau^{-2}_1\beta_1^2}{2}\right)\\
+&\propto \exp\left(-\frac{1}{2}(n\sigma^{-2}\bar Z_{s,1} + \tau^{-2}_1)\beta^2_1 + (n \sigma^{-2} \bar\upsilon_{11} \beta_1)\right)
+\end{align}
+
+This implies that 
+$$\beta_1 \mid \mathrm{rest} \sim \mathrm{N}\left(\frac{n\sigma^{-2} \bar\upsilon_{11}}{n\sigma^{-2}\bar Z_{s,1}+\tau^{-2}_1},\frac{1}{n\sigma^{-2}\bar Z_{s,1}+\tau^{-2}_1}\right)$$
+where $\bar\upsilon_{11} = n^{-1} \sum_{i=1}^n Z_{1i} (Y_i - \beta_0  - \beta_2 Z_{2i}) = \bar Y_{z,1} - \beta_0 \bar Z_{1} - \beta_2 \bar Z_{12}$ and $\bar Z_{s,1} = n^{-1}\sum_{i=1}^n Z^2_{1i}$
+
+
+The full conditional distribution for $\beta_2$ is
+
+\begin{align}
+\pi(\beta_2 \mid \mathrm{rest}) &\propto \exp\left(-\frac{\sigma^{-2}}{2}\sum_{i=1}^n (Y_i - \beta_0 - \beta_1 Z_{i1}  -\beta_2 Z_{i2})^2\right) \exp\left(-\frac{\tau^{-2}_2\beta_2^2}{2}\right)\\
+&\propto \exp\left(-\frac{\sigma^{-2}}{2}\sum_{i=1}^n (\upsilon_{2i} - Z_{2i}\beta_2)^2\right) \exp\left(-\frac{\tau^{-2}_2\beta_2^2}{2}\right)\\
+&\propto \exp\left(-\frac{1}{2}(n\sigma^{-2}\bar Z_{s,2} + \tau^{-2}_2)\beta^2_2 + (n \sigma^{-2} \bar\upsilon_{22} \beta_2)\right)
+\end{align}
+
+This implies that 
+$$\beta_2 \mid \mathrm{rest} \sim \mathrm{N}\left(\frac{n\sigma^{-2} \bar\upsilon_{22}}{n\sigma^{-2}\bar Z_{s,2}+\tau^{-2}_2},\frac{1}{n\sigma^{-2}\bar Z_{s,2}+\tau^{-2}_2}\right)$$
+where $\bar\upsilon_{22} = n^{-1} \sum_{i=1}^n Z_{2i} (Y_i - \beta_0  - \beta_1 Z_{1i}) = \bar Y_{z,2} - \beta_0 \bar Z_{2} - \beta_1 \bar Z_{12}$ and $\bar Z_{s,2} = n^{-1}\sum_{i=1}^n Z^2_{2i}$
+
+The full conditional distribution for $\tau^{-2}_j$ for $j = 0 ,1, 2$ is 
+
+\begin{align}
+\pi(\tau^{-2}_j \mid \mathrm{rest}) &\propto (\tau^{-2}_j)^{1/2}\exp\left(-\frac{\tau^{-2}_j\beta_j^2}{2}\right) (\tau^{-2}_j)^{a_\tau - 1} \exp(-b_\tau \tau^{-2}_j)\\
+&\propto (\tau^{-2}_j)^{1/2 + a_\tau  - 1}\exp\left\{-\left(\frac{\beta_j^2}{2} + b_\tau\right)\tau^{-2}_j\right\}
+\end{align}
+This implies that
+$$\tau_j^{-2} \mid \mathrm{rest} \sim \mathrm{G}\left(1/2 + a_\tau,\beta_j^2/2 + b_\tau\right)$$
+The full conditional distribution of $\sigma^{-2}$ is
+\begin{align}
+ \pi(\sigma^{-2}\mid \mathrm{rest}) &\propto \prod_{i=1}^n \pi(Y_i\mid X_{1i},X_{2i},\beta_0, \beta_1, \beta_2,\sigma^{-2})\pi(\sigma^{-2})\\
+ &\propto (\sigma^{-2})^{n/2}\exp\left(-\frac{\sigma^{-2}}{2}\sum_{i=1}^n (Y_i - \beta_0 - \beta_1 Z_{i1}  -\beta_2 Z_{i2})^2\right) \times (\sigma^{-2})^{a_\sigma - 1} \exp(-b_\sigma \sigma^{-2})\\
+ &\propto (\sigma^{-2})^{n/2 + a_\sigma - 1}\exp\left\{-\left(\frac{n}{2}\upsilon_s + b_\sigma\right) \sigma^{-2}\right\}
+\end{align}
+
+This implies that 
+$$\sigma^{-2} \mid \mathrm{rest} \sim \mathrm{G}(n/2 + a_\sigma, (n\upsilon_s)/2 + b_\sigma)$$
+where $\upsilon_s = n^{-1}\sum_{i=1}^n (Y_i - \beta_0 - \beta_1 Z_{1i} - \beta_2 Z_{2i})^2$
+
+The implement the Gibbs sampler, we also define the following variables that involve both parameters and observed data
+
+
+* $\mu_i =  \beta_0 + \beta_1 Z_{1i} +\beta_2 Z_{2i}$
+
+* $\upsilon_i = Y_i - \mu_i$
+
+* $\upsilon_{0i} = Y_i - \beta_1 Z_{1i} - \beta_2 Z_{2i} = \upsilon_i + \beta_0$
+
+* $\upsilon_{1i} = Y_i - \beta_0  - \beta_2 Z_{2i} = \upsilon_i + \beta_1 Z_{1i}$
+
+* $\upsilon_{2i} = Y_i - \beta_0  - \beta_1 Z_{1i} = \upsilon_i + \beta_2 Z_{2i}$
+
+Furthermore, we can obtain the summarize statistics of those variables. 
+
+* $\bar \mu = \beta_0 + \beta_1 \bar Z_1 + \beta_2 \bar Z_2$
+
+* $\bar Y_{\mu} = n^{-1}\sum_{i=1}^n Y_i\mu_i = \beta_0 \bar Y + \beta_1 \bar Y_{z, 1} + \beta_2 \bar Y_{z, 2}$. 
+
+
+* $\bar \upsilon_{s} = n^{-1}\sum_{i=1}^n ( Y_i - \mu_i)^2$
+<!-- $= n^{-1}\left( \sum_{i=1}^n Y^2_i - 2Y_i\mu_i + \mu_i^2\right) = \bar Y_{s} - 2 \bar Y_{\mu} + \bar\mu_s$ -->
+
+* $\bar\upsilon_0 = n^{-1} \sum_{i=1}^n \upsilon_{0i} = \bar Y - \beta_1 \bar Z_1 - \beta_2 \bar Z_2$
+
+* $\bar\upsilon_{11} = n^{-1} \sum_{i=1}^n \upsilon_{1i}Z_{1i} = \bar Y_{z,1} - \beta_0 \bar Z_1 - \beta_2 \bar Z_{12}$ 
+
+* $\bar\upsilon_{22} = n^{-1} \sum_{i=1}^n \upsilon_{2i}Z_{2i} = \bar Y_{z,2} - \beta_0 \bar Z_2 - \beta_1 \bar Z_{12}$
+
+
+Below we show a diagram to indicate that dependence between variables in the Gibbs samplers
+
+```{r,echo = FALSE}
+library(DiagrammeR)
+grViz("
+digraph BayesianInference {
+  rankdir=LR;  // Left to Right orientation
+  
+  graph [layout = circo]
+
+  // Define node styles
+  node [shape = circle, fontsize = 12];
+
+  // Define nodes with LaTeX labels
+  beta0     [label = 'β₀', ordering = out];
+  upsilon0  [label = 'υ₀'];
+  beta1     [label = 'β₁', ordering = out];
+  upsilon11 [label = 'υ₁₁'];
+  beta2     [label = 'β₂', ordering = out];
+  upsilon22 [label = 'υ₂₂'];
+  tau0 [label = '𝝉\u2080'];
+  tau1 [label = '𝝉\u2081'];
+  tau2 [label = '𝝉\u2082'];
+  sigma [label = 'σ']
+  upsilons [label = '𝜐\u0304_s'];
+  Ymu [label = 'Y_μ'];
+  mus [label = 'μ_s'];
+  
+  
+  // Define edges (connections)
+  upsilon0  -> beta0;
+  upsilon11 -> beta1;
+  upsilon22 -> beta2;
+  
+  beta0 -> {upsilon11; upsilon22; Ymu; mus; tau0;}
+  beta1  -> {upsilon0; upsilon22; Ymu; mus; tau1;}
+  beta2  -> {upsilon0; upsilon11; Ymu; mus; tau2;}
+  
+  
+  Ymu -> upsilons;
+  mus -> upsilons;
+  
+  upsilons -> sigma;
+  
+  sigma -> beta1;
+  sigma -> beta2;
+  sigma -> beta0;
+  
+  tau0 -> beta0;
+  tau1 -> beta1;
+  tau2 -> beta2
+}
+")
+
+```
+
+### R implementation
+
+We first define the functions for each update
+```{r}
+update_beta <- function(clean_dat, paras){
+  
+  #update beta0
+  post_prec0 <- clean_dat$n*paras$inv_sigma_sq + paras$inv_tau_sq[1]
+  upsilon0 <- clean_dat$YZbar[1] - paras$beta[2]*clean_dat$Zbar[2] - paras$beta[3]*clean_dat$Zbar[3]
+  post_mean0 <- (clean_dat$n*paras$inv_sigma_sq*upsilon0)/post_prec0
+  paras$beta[1] <- post_mean0 + rnorm(1)/sqrt(post_prec0)
+  
+  #update beta1
+  post_prec1 <- clean_dat$n*clean_dat$Zsqbar[2]*paras$inv_sigma_sq + paras$inv_tau_sq[2]
+  upsilon11 <- clean_dat$YZbar[2] - paras$beta[1]*clean_dat$Zbar[2] - paras$beta[3]*clean_dat$Z12bar
+  post_mean1 <- (clean_dat$n*paras$inv_sigma_sq*upsilon11)/post_prec1
+  paras$beta[2] <- post_mean1 + rnorm(1)/sqrt(post_prec1)
+  
+  #update beta2
+  post_prec2 <- clean_dat$n*clean_dat$Zsqbar[3]*paras$inv_sigma_sq + paras$inv_tau_sq[3]
+  upsilon22 <- clean_dat$YZbar[3] - paras$beta[1]*clean_dat$Zbar[3] - paras$beta[2]*clean_dat$Z12bar
+  post_mean2 <- (clean_dat$n*paras$inv_sigma_sq*upsilon22)/post_prec2
+  paras$beta[3] <- post_mean2 + rnorm(1)/sqrt(post_prec2)
+  
+  return(paras$beta) 
+}
+
+update_inv_tau_sq <- function(clean_dat, paras){
+  return(rgamma(3,shape=paras$a_tau + 1/2, rate = paras$beta^2/2 + paras$b_tau))
+}
+
+update_inv_sigma_sq <- function(clean_dat, paras){
+  mu <- paras$beta[1] + paras$beta[2]*clean_dat$Z1 + paras$beta[3]*clean_dat$Z2
+  return(rgamma(1, clean_dat$n/2 + paras$a_sigma, clean_dat$n*mean((clean_dat$Y - mu)^2)/2 + paras$b_sigma))
+}
+```
+
+The we create the Gibbs sampler functions and convert the output to an mcmc object defined by the coda package. The coda package in R is widely used for analyzing Markov Chain Monte Carlo (MCMC) outputs. 
+
+```{r}
+
+LM_Gibbs <- function(clean_dat, 
+                     paras, 
+                     controls){
+  
+  paras0 = paras
+  total_iters = controls$burn_in + controls$mcmc_sample*controls$thinning
+  mcmc <- list(
+    beta = matrix(NA,ncol=3,nrow=controls$mcmc_sample),
+    inv_sigma_sq = matrix(NA, ncol=1,nrow=controls$mcmc_sample),
+    inv_tau_sq = matrix(NA,ncol=3,nrow=controls$mcmc_sample)
+  )
+  colnames(mcmc$beta) = paste0("beta",0:2)
+  colnames(mcmc$inv_tau_sq) = paste0("inv_tau_sq",0:2)
+  colnames(mcmc$inv_sigma_sq) = "inv_sigma_sq"
+  if(!is.null(controls$seed))
+    set.seed(controls$seed)
+  k = 1
+  if(controls$burn_in==0){
+    mcmc$beta[k,] <- paras$beta
+    mcmc$inv_sigma_sq[k] <- paras$inv_sigma_sq
+    mcmc$inv_tau_sq[k,] <- paras$inv_tau_sq 
+    k = k + 1
+  }
+  
+  for(iter in 2:total_iters){
+    #update beta
+    paras$beta <- update_beta(clean_dat, paras)
+    #update inv_tau_sq
+    paras$inv_tau_sq <- update_inv_tau_sq(clean_dat, paras)
+    #updat inv_sigma_sq
+    paras$inv_sigma_sq <- update_inv_sigma_sq(clean_dat, paras)
+    
+    if(iter > controls$burn_in){
+      if((iter - controls$burn_in)%%controls$thinning==0){
+        mcmc$beta[k,] <- paras$beta
+        mcmc$inv_sigma_sq[k] <- paras$inv_sigma_sq
+        mcmc$inv_tau_sq[k,] <- paras$inv_tau_sq 
+        k = k + 1  
+      }
+    }
+  }
+  
+  mcmc$beta <- mcmc(mcmc$beta,start=controls$burn_in+1,end=total_iters,thin=controls$thinning)
+  mcmc$inv_tau_sq <- mcmc(mcmc$inv_tau_sq,start=controls$burn_in+1,end=total_iters,thin=controls$thinning)
+  
+  mcmc$inv_sigma_sq <- mcmc(mcmc$inv_sigma_sq,start=controls$burn_in+1,end=total_iters,thin=controls$thinning)
+  
+  return(list(mcmc=mcmc, 
+              paras_initial = paras0, 
+              paras_last = paras, 
+              controls=controls))
+}
+```
+
+### Example runs of Gibbs sampler
+
+```{r}
+gibbs_res <- LM_Gibbs(clean_dat,
+                paras = paras,
+                controls = controls)
+```
+
+## Group variable Gibbs sampler
+
+Instead of updating one parameter a time, we can jointly update regression coefficents $\beta = (\beta_0, \beta_1, \beta_2)^\top$ together. To derive the 
+full conditional distribution of $\beta$ we consider a matrix representation of 
+the regression model:
+$$Y = Z\beta + E, \quad E\sim \mathrm{N}(0, \sigma^2 I_n)$$
+where $Y = (Y_1,\ldots, Y_n)^\top$ is an $n\times 1$ vector, $Z = (1_n, Z_1, Z_2)$ is of dimension $n\times 3$ with $Z_1 = (Z_{11},\ldots, Z_{1n})^\top$ and $Z_2 = (Z_{21},\ldots, Z_{2n})^\top$ and a matrix representation of prior specifications for $\beta$
+
+$$\beta \sim \mathrm{N}(0,\Omega^{-1}),$$
+where $\Omega = \mathrm{diag}\{\tau_0^{-2},\tau_1^{-2},\tau_2^{-2}\}$. 
+
+The full conditional distribution of $\beta$ is
+\begin{align}
+\pi(\beta\mid \mathrm{rest}) &\propto \pi(Y\mid \beta, \sigma^{-2}) \pi(\beta\mid T)\\
+&\propto \exp\left(-\frac{\sigma^{-2}}{2}(Y - Z\beta)^\top (Y - Z\beta)\right)\exp( -\frac{1}{2}\beta^\top \Omega \beta)\\
+&\propto \exp\left(-\frac{1}{2}\beta^\top (\sigma^{-2}Z^\top Z + \Omega)\beta + \sigma^{-2} Y^\top Z\beta\right)
+\end{align}
+This implies that
+$$\beta \mid \mathrm{rest} \sim \mathrm{N}\left\{(\sigma^{-2}Z^\top Z + \Omega)^{-1}\sigma^{-2}Z^\top Y, (\sigma^{-2}Z^\top Z + \Omega)^{-1}\right\}$$
+For other parameters the full conditional distributions are the same as the single variable update Gibbs sampler.
+
+### R implementation
+
+We define functions to update $\beta$ using the matrix sufficient statistics 
+
+```{r}
+update_blocked_beta <- function(mat_dat,paras){
+  prec_mat <- paras$inv_sigma_sq*mat_dat$ZtZ
+  diag(prec_mat) <- diag(prec_mat) + paras$inv_tau_sq
+  R <- chol(prec_mat)
+  prec_mu <- paras$inv_sigma_sq*mat_dat$ZtY
+  X <- forwardsolve(R,prec_mu,upper.tri=TRUE,transpose=TRUE)
+  paras$beta <- backsolve(R, X + rnorm(length(paras$beta)))
+  return(paras$beta)
+}
+
+update_blocked_inv_tau_sq <- function(mat_dat, paras){
+  return(rgamma(3,shape=paras$a_tau + 1/2, rate = paras$beta^2/2 + paras$b_tau))
+}
+
+update_blocked_inv_sigma_sq <- function(mat_dat, paras){
+  mu <- mat_dat$Z%*%paras$beta
+  return(rgamma(1, mat_dat$n/2 + paras$a_sigma, mat_dat$n*mean((mat_dat$Y - mu)^2)/2 + paras$b_sigma))
+}
+```
+
+We implement the group updating scheme for $\beta$ using Gibbs sampler
+
+```{r}
+LM_blocked_Gibbs <- function(mat_dat, 
+                     paras, 
+                     controls){
+  
+  paras0 = paras
+  total_iters = controls$burn_in + controls$mcmc_sample*controls$thinning
+  mcmc <- list(
+    beta = matrix(NA,ncol=3,nrow=controls$mcmc_sample),
+    inv_sigma_sq = matrix(NA, ncol=1,nrow=controls$mcmc_sample),
+    inv_tau_sq = matrix(NA,ncol=3,nrow=controls$mcmc_sample)
+  )
+  colnames(mcmc$beta) = paste0("beta",0:2)
+  colnames(mcmc$inv_tau_sq) = paste0("inv_tau_sq",0:2)
+  colnames(mcmc$inv_sigma_sq) = "inv_sigma_sq"
+  if(!is.null(controls$seed))
+    set.seed(controls$seed)
+  k = 1
+  if(controls$burn_in==0){
+    mcmc$beta[k,] <- paras$beta
+    mcmc$inv_sigma_sq[k] <- paras$inv_sigma_sq
+    mcmc$inv_tau_sq[k,] <- paras$inv_tau_sq 
+    k = k + 1
+  }
+  
+  for(iter in 2:total_iters){
+    #update beta
+    paras$beta <- update_blocked_beta(mat_dat, paras)
+    #update inv_tau_sq
+    paras$inv_tau_sq <- update_blocked_inv_tau_sq(mat_dat, paras)
+    #updat inv_sigma_sq
+    paras$inv_sigma_sq <- update_blocked_inv_sigma_sq(mat_dat, paras)
+    
+    if(iter > controls$burn_in){
+      if((iter - controls$burn_in)%%controls$thinning==0){
+        mcmc$beta[k,] <- paras$beta
+        mcmc$inv_sigma_sq[k] <- paras$inv_sigma_sq
+        mcmc$inv_tau_sq[k,] <- paras$inv_tau_sq 
+        k = k + 1  
+      }
+    }
+  }
+  
+  mcmc$beta <- mcmc(mcmc$beta,start=controls$burn_in+1,end=total_iters,thin=controls$thinning)
+  mcmc$inv_tau_sq <- mcmc(mcmc$inv_tau_sq,start=controls$burn_in+1,end=total_iters,thin=controls$thinning)
+  
+  mcmc$inv_sigma_sq <- mcmc(mcmc$inv_sigma_sq,start=controls$burn_in+1,end=total_iters,thin=controls$thinning)
+  
+  return(list(mcmc=mcmc, 
+              paras_initial = paras0, 
+              paras_last = paras, 
+              controls=controls))
+}
+
+```
+
+### Example run of blocked Gibbs sampler
+
+```{r}
+blocked_gibbs_res <- LM_blocked_Gibbs(mat_dat,
+                                  paras = paras,
+                                  controls=controls)
+```
+
+
+
+# MCMC output anlaysis
+
+## Summarizing MCMC output 
+
+```{r}
+summary(random_walk_res$mcmc$beta)
+summary(gibbs_res$mcmc$beta)
+summary(blocked_gibbs_res$mcmc$beta)
+```
+
+## Plotting MCMC Diagnostics 
+
+### Trace Plots and density plots
+
+Trace plots help you evaluate the convergence of the chains
+Density plots show you the distributions of posterior samples
+
+```{r}
+plot(random_walk_res$mcmc$beta)
+plot(gibbs_res$mcmc$beta)
+plot(blocked_gibbs_res$mcmc$beta)
+```
+
+
+### Autocorrelation Plots
+
+To check auto correlations in the chain
+```{r}
+autocorr.plot(random_walk_res$mcmc$beta)
+autocorr.plot(gibbs_res$mcmc$beta)
+autocorr.plot(blocked_gibbs_res$mcmc$beta)
+```
+
+### Check Effective Sample Size
+```{r}
+effectiveSize(random_walk_res$mcmc$beta)
+effectiveSize(gibbs_res$mcmc$beta)
+effectiveSize(blocked_gibbs_res$mcmc$beta)
+```
+
+### Run Geweke Diagnostics
+```{r}
+geweke.diag(random_walk_res$mcmc$beta)
+geweke.diag(gibbs_res$mcmc$beta)
+geweke.diag(blocked_gibbs_res$mcmc$beta)
+```
+
+### Run multiple chains and Gelman Rubin Tests
+```{r}
+paras <- list(beta = c(1,1,1),
+              inv_tau_sq = c(0.01,0.01,0.01),
+              inv_sigma_sq = 0.001,
+              a_tau = 0.001,
+              b_tau = 0.001,
+              a_sigma = 0.001,
+              b_sigma = 0.001)
+
+controls <- list(mcmc_sample = 500,
+                 burn_in = 1000,
+                 thinning = 1,
+                 seed = NULL)
+
+
+prop_sd <- c(beta = c(1.0, 0.1, 0.1), inv_sigma_sq = 0.1, inv_tau_sq  = 0.1)
+
+random_walk_res_1 <- LM_random_walk(mat_dat, paras, controls, prop_sd = prop_sd, ar_step = 50)
+random_walk_res_2 <- LM_random_walk(mat_dat, paras, controls, prop_sd = prop_sd, ar_step = 50)
+random_walk_res_3 <- LM_random_walk(mat_dat, paras, controls, prop_sd = prop_sd, ar_step = 50)
+
+random_walk_mcmc_list <- mcmc.list(random_walk_res_1$mcmc$beta,
+                                   random_walk_res_2$mcmc$beta,
+                                   random_walk_res_3$mcmc$beta)
+
+plot(random_walk_mcmc_list)
+gelman.diag(random_walk_mcmc_list)
+```
+For blocked Gibbs sampler
+
+```{r}
+blocked_Gibbs_res_1 <- LM_blocked_Gibbs(mat_dat, paras, controls)
+blocked_Gibbs_res_2 <- LM_blocked_Gibbs(mat_dat, paras, controls)
+blocked_Gibbs_res_3 <- LM_blocked_Gibbs(mat_dat, paras, controls)
+
+blocked_Gibbs_mcmc_list <- mcmc.list(blocked_Gibbs_res_1$mcmc$beta,
+                                   blocked_Gibbs_res_2$mcmc$beta,
+                                   blocked_Gibbs_res_3$mcmc$beta)
+plot(blocked_Gibbs_mcmc_list)
+gelman.diag(blocked_Gibbs_mcmc_list)
+
+```

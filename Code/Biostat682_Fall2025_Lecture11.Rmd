@@ -1,0 +1,613 @@
+---
+title: "Biostat 682 — Lecture 11: Beyond Linear Regression"
+author: "Jian Kang"
+date: "2025-10-26"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+    code_folding: show
+fontsize: 11pt
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE, 
+                      fig.align = "center", fig.width = 7, fig.height = 4.5, 
+                      dpi = 150, out.width = "90%")
+set.seed(68211)
+
+
+library(R2jags)
+#Set the project path
+#You need to copy bone_density.RData, Ozone_levels.RData and spambase.Rdata into projpath
+projpath = "/Users/jiankang/University of Michigan Dropbox/Jian Kang/Umich/Biostat682/Fall2025/data/"
+
+```
+
+```{r prerequisites}
+# Core packages commonly used across the five examples
+pkgs <- c("R2jags","coda","ggplot2","splines")
+to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(to_install)) install.packages(to_install, repos = "https://cloud.r-project.org")
+invisible(lapply(pkgs, library, character.only = TRUE))
+```
+
+# Introduction
+This notebook is a **self-contained learning resource**—you can read it, run it, and explore all code examples directly without any external files. Each section walks through a key class of Bayesian models that extend the linear framework:
+
+- **Random Effects**: modeling hierarchical or clustered data  
+- **Random Slopes**: allowing group-specific trends  
+- **Semiparametric Regression**: introducing flexible smooth functions via splines  
+- **Gaussian Process Regression**: a fully nonparametric Bayesian approach  
+- **Bayesian Logistic Regression**: for binary outcomes  
+
+For each model, you’ll find:
+- A short conceptual overview and model equation  
+- Notes highlighting intuition and connections  
+- The complete annotated R code using `R2jags` for Bayesian inference  
+
+
+# Random Intercept Model
+
+**Objectives**
+- Understand the model formulation and priors.
+- Run the full example end-to-end and interpret posterior summaries.
+- Connect diagnostics to modeling decisions (priors, pooling, nonlinearity, link).
+
+**Model**
+
+$$
+y_{ij} \mid u_j, \sigma^2 \sim \mathcal{N}(\beta_0 + u_j, \sigma^2), 
+\qquad u_j \sim \mathcal{N}(0, \tau^2).
+$$
+
+
+**Notes**
+- Contrast no pooling vs complete pooling vs partial pooling.
+- Emphasize shrinkage: magnitude driven by $\tau^2$ relative to $\sigma^2$.
+- Interpret $u_j$ as group-level deviations from the grand mean.
+
+## R JAGS Example
+
+```{r random_intercepts_inline, echo=TRUE, message=TRUE, warning=TRUE}
+#----------------------------- Two-way random effects model -----------------------------
+#load one month ozone data
+load(file= file.path(projpath,"Ozone_levels.RData"))
+# Y: ozone levels
+# s: locations
+
+ns   <- nrow(Y)
+nt   <- ncol(Y)
+
+Ybar <- mean(Y,na.rm=TRUE)
+
+#spatial distribution of the monitors
+plot(s[1:100,],axes=FALSE,xlab="",ylab="",main="Monitor locations",pch=19,cex=0.5,col="blue")
+
+#Ozone level changes over time
+boxplot(Y,xlab="Day in one month",ylab="Ozone levels",main="Ozone by day")
+abline(75,0,col=2)
+
+
+JAGS_Ozone_model = function(){
+  # Likelihood
+  for (i in 1:ns) {
+    for (j in 1:nt) {
+      Y[i, j]    ~ dnorm(mean[i, j], taue)
+      mean[i, j] <- mu + alpha[i] + gamma[j]
+    }
+  }
+
+  # Random effects
+  for (i in 1:ns) {
+    alpha[i] ~ dnorm(0, taus)
+  }
+  for (j in 1:nt) {
+    gamma[j] ~ dnorm(0, taut)
+  }
+
+  # Priors
+  mu   ~ dnorm(0, 0.01)
+  taue ~ dgamma(0.1, 0.1)
+  taus ~ dgamma(0.1, 0.1)
+  taut ~ dgamma(0.1, 0.1)
+
+  # Output the parameters of interest
+  sigma2[1] <- 1 / taue
+  sigma2[2] <- 1 / taus
+  sigma2[3] <- 1 / taut
+  sigma[1]  <- 1 / sqrt(taue)
+  sigma[2]  <- 1 / sqrt(taus)
+  sigma[3]  <- 1 / sqrt(taut)
+  pct[1]    <- sigma2[1] / sum(sigma2[])
+  pct[2]    <- sigma2[2] / sum(sigma2[])
+  pct[3]    <- sigma2[3] / sum(sigma2[])
+
+}
+
+fit_JAGS_Ozone_model = jags(
+  data = list(Y = Y, ns = ns, nt = nt),
+  inits = list(list(mu=Ybar)),
+  parameters.to.save = c("sigma","pct","gamma"),
+  n.chains = 1,
+  n.iter = 10000,
+  n.burnin = 1000,
+  model.file = JAGS_Ozone_model
+)
+
+
+sum_Ozone_model = summary(as.mcmc(fit_JAGS_Ozone_model))
+q <- sum_Ozone_model$quantiles
+
+R  <- Y-mean(Y,na.rm=TRUE)
+boxplot(R,xlab="Data",ylab="Ozone (centered)",outline=FALSE,
+        main="Data versus posterior of the random effects")
+lines(q[1:31,1],col=2,lty=2)
+lines(q[1:31,3],col=2,lty=1)
+lines(q[1:31,5],col=2,lty=2)
+legend("topright",c("Median","95% interval"),lty=1:2,col=2,bg=gray(1),inset=0.05)
+
+
+
+```
+
+---
+
+# Random Slope Model
+
+**Objectives**
+- Understand the model formulation and priors.
+- Run the full example end-to-end and interpret posterior summaries.
+- Connect diagnostics to modeling decisions (priors, pooling, nonlinearity, link).
+
+**Model**
+
+$$
+y_{ij} = (\beta_0 + u_{0j}) + (\beta_1 + u_{1j}) x_{ij} + \epsilon_{ij},\quad
+\begin{pmatrix} u_{0j} \\ u_{1j} \end{pmatrix} \sim \mathcal{N}\!\left(
+\begin{pmatrix}0 \\ 0\end{pmatrix}, \Sigma_u\right).
+$$
+
+
+**Notes**
+- Show partial pooling of slopes across groups.
+- Discuss interpretation of $\Sigma_u$: how intercept and slope co-vary across groups.
+- Visualize group-specific regression lines with credible bands.
+
+## R JAGS Example
+
+```{r random_slopes_inline, echo=TRUE, message=TRUE, warning=TRUE}
+#----------------------------- Random Slopes Model -----------------------------
+
+
+load(file.path(projpath,"bone_density.RData"))
+
+#preprocess data
+Y <- matrix(Y,20,4,byrow=TRUE)
+X <- cbind(1,age)
+
+
+#Plot the data for each subject:
+
+plot(NA,xlim=range(age),ylim=range(Y),xlab="Age",ylab="Bone mass density")
+for(i in 1:N){
+  lines(age,Y[i,])
+  points(age,Y[i,])
+}
+
+
+JAGS_RE_model = function() {
+  # Likelihood
+  for (i in 1:N) {
+    for (j in 1:3) {
+      Y[i, j]    ~ dnorm(meanY[i, j], taue)
+      meanY[i, j] <- beta[i, 1] + beta[i, 2] * age[j]
+    }
+  }
+
+  # Random effects
+  for (i in 1:N) {
+    beta[i, 1:2] ~ dmnorm(mu[1:2], Omega[1:2, 1:2])
+  }
+
+  # Priors
+  taue  ~ dgamma(0.001, 0.001)
+  mu[1] ~ dnorm(0, 0.001)
+  mu[2] ~ dnorm(0, 0.001)
+
+  Omega[1:2, 1:2] ~ dwish(R[, ], 2.001)
+  R[1, 1] <- 1 / 2.001
+  R[1, 2] <- 0
+  R[2, 1] <- 0
+  R[2, 2] <- 1 / 2.001
+
+  # Output the parameters of interest
+  for (i in 1:N) {
+    pred[i] <- beta[i, 1] + beta[i, 2] * age[4]
+  }
+}
+
+fit_JAGS_RE_model = jags(
+  data = list(Y = Y[,1:3], age=age, N = N),
+  inits = list(list(taue=1)),
+  parameters.to.save = c("pred"),
+  n.chains = 1,
+  n.iter = 10000,
+  n.burnin = 1000,
+  model.file = JAGS_RE_model
+)
+
+
+post_mean <- summary(as.mcmc(fit_JAGS_RE_model))$statistics[paste("pred[",1:20,"]",sep=""),1]
+Yp        <- Y
+Yp[,4]    <- post_mean
+
+par(mfcol=c(2,2))
+
+matplot(age,t(Y),type="l",xlab="Visit",ylab="Bone density",main="Data")
+matplot(age,t(Y),add=TRUE,pch=19)
+
+matplot(age,t(Yp),type="l",xlab="Visit",ylab="Bone density",main="Data with predicted value for visit 4")
+matplot(age[1:3],t(Yp[,1:3]),add=TRUE,pch=19)
+points(rep(age[4],N),post_mean,col=1:N)
+
+plot(Y[,4],Yp[,4],main="Obs. V.S. Pred.",xlab="Observation", ylab="Prediction")
+abline(a=0,b=1)
+
+
+
+```
+
+---
+
+# Bayesian Semiparametric Regression
+
+**Objectives**
+- Understand the model formulation and priors.
+- Run the full example end-to-end and interpret posterior summaries.
+- Connect diagnostics to modeling decisions (priors, pooling, nonlinearity, link).
+
+**Model**
+
+$$
+y_i = \beta_0 + \sum_{k=1}^{K} \beta_k B_k(x_i) + \epsilon_i, \qquad
+\beta_k \sim \mathcal{N}(0, \tau^2).
+$$
+
+
+**Notes**
+- Motivate splines/basis expansions for smooth nonlinear effects.
+- Discuss knot placement, degrees of freedom, and shrinkage priors.
+- Compare with GP modeling as a fully nonparametric alternative.
+
+## R JAGS Example
+
+```{r semiparametric_inline, echo=TRUE, message=TRUE, warning=TRUE}
+#----------------------------- Bayesian semiparametric model -----------------------------
+library(splines)
+library(MASS)
+
+help(mcycle)
+#Preprocessing data
+Y = mcycle$accel
+X = mcycle$times
+
+Y <- (Y-mean(Y))/sd(Y)
+X <- X/max(X)
+n = length(Y)
+
+
+#Plot the data
+par(mfcol=c(1,1))
+plot(X,Y,xlab="time",ylab="Acceleration",cex.lab=1.5,cex.axis=1.5)
+
+#set up a spline basis function
+
+j = 10
+g_X = bs(X,df=j)%*%rnorm(j)
+plot(X,g_X,type="l",col="red",lwd=2)
+
+J = 20
+B = bs(X,df = J)
+dim(B)
+
+matplot(X,B,type="l",xlab="Time",ylab="Basis function, Bj(X)",cex.lab=1.5,cex.axis=1.5,lwd=2)
+
+
+JAGS_mcycle_model = function() {
+  # Likelihood
+  for (i in 1:n) {
+    Y[i]    ~ dnorm(mean[i], taue)
+    mean[i] <- mu + inprod(B[i, ], beta[])
+  }
+
+  # Random effects
+  for (i in 1:J) {
+    beta[i] ~ dnorm(0, taub)
+  }
+
+  # Priors
+  mu   ~ dnorm(0, 0.01)
+  taue ~ dgamma(0.1, 0.1)
+  taub ~ dgamma(0.1, 0.1)
+
+}
+
+fit_JAGS_mcycle_model = jags(
+  data = list(Y = Y, n=n, B=B, J = J),
+  inits = list(list(mu = mean(Y),beta=rep(0,J),taue=var(Y))),
+  parameters.to.save = c("mean"),
+  n.chains = 1,
+  n.iter = 10000,
+  n.burnin = 1000,
+  model.file = JAGS_mcycle_model
+)
+
+
+q <- summary(as.mcmc(fit_JAGS_mcycle_model))$quantile[paste("mean[",1:n,"]",sep=""),]
+plot(X,Y,xlab="time",ylab="Acceleration",cex.lab=1.5,cex.axis=1.5,main="Bayesian Semi-parametric regression (Splines)")
+
+lines(X,q[,1],col=2,lty=2)
+lines(X,q[,3],col=2,lty=1)
+lines(X,q[,5],col=2,lty=2)
+
+legend("bottomright",c("Median","95% interval"),lty=1:2,col=2,bg=gray(1),inset=0.05,cex=1.5)
+
+
+
+```
+
+---
+
+# Gaussian Process Regression
+
+**Objectives**
+- Understand the model formulation and priors.
+- Run the full example end-to-end and interpret posterior summaries.
+- Connect diagnostics to modeling decisions (priors, pooling, nonlinearity, link).
+
+**Model**
+
+$$
+f(x) \sim \mathcal{GP}(0,\, k(x,x')), \qquad 
+k(x,x') = \sigma_f^2 \exp\!\left[-\frac{(x-x')^2}{2\rho^2}\right].
+$$
+
+
+**Notes**
+- Clarify roles of hyperparameters: $\sigma_f$ (signal), $\rho$ (length-scale), and noise $\sigma$.
+- For JAGS, it’s common to fix kernel hyperparameters (or use grid search); in PyMC you can learn them.
+- Show posterior mean and uncertainty bands over a prediction grid.
+
+## R JAGS Example
+
+```{r gp_inline, echo=TRUE, message=TRUE, warning=TRUE}
+
+#----------------------------- Bayesian nonparametric model -----------------------------
+library(splines)
+library(MASS)
+
+help(mcycle)
+#Preprocessing data
+Y = mcycle$accel
+X = mcycle$times
+
+Y <- (Y-mean(Y))/sd(Y)
+X <- X/max(X)
+n = length(Y)
+
+
+#Plot the data
+par(mfcol=c(1,1))
+plot(X,Y,xlab="time",ylab="Acceleration",cex.lab=1.5,cex.axis=1.5)
+
+#set up grid points
+
+
+xgrid = seq(0,1,length=100)
+
+ngrid = length(xgrid)
+
+xxgrid = c(X,xgrid)
+
+rho = 100
+grids=expand.grid(xxgrid,xxgrid)
+Sigma=matrix(exp(-rho*abs((grids[,1]-grids[,2]))^1.99),nrow=ngrid+n)
+diag(Sigma) = diag(Sigma)+0.001
+
+
+JAGS_GP_mcycle_model = function() {
+  # Likelihood
+  for (i in 1:n) {
+    Y[i]    ~ dnorm(mean[i], taue)
+  }
+  mean ~ dmnorm(zeros,Omega)
+
+  for(i in 1:ngrid){
+    meangrid[i] <- mean[n+i]
+  }
+
+  Omega <- inverse(Sigma)
+
+
+  # Priors
+  taue ~ dgamma(0.1, 0.1)
+
+}
+
+fit_JAGS_GP_mcycle_model = jags(
+  data = list(Y = Y, ngrid=ngrid, n=n,Sigma=Sigma,zeros=rep(0,n+ngrid)),
+  inits = list(list(mean = rep(0,length=n+ngrid),taue=var(Y))),
+  parameters.to.save = c("meangrid"),
+  n.chains = 1,
+  n.iter = 1000,
+  n.burnin = 200,
+  model.file = JAGS_GP_mcycle_model
+)
+
+
+q <- summary(as.mcmc(fit_JAGS_GP_mcycle_model))$quantile[paste("meangrid[",1:ngrid,"]",sep=""),]
+plot(X,Y,xlab="time",ylab="Acceleration",cex.lab=1.5,cex.axis=1.5,main="Bayesian nonparametric regression (GP)")
+
+lines(xgrid,q[,1],col=2,lty=2)
+lines(xgrid,q[,3],col=2,lty=1)
+lines(xgrid,q[,5],col=2,lty=2)
+
+legend("bottomright",c("Median","95% interval"),lty=1:2,col=2,bg=gray(1),inset=0.05,cex=1.5)
+
+```
+
+---
+
+# Bayesian Logistic Regression
+
+**Objectives**
+- Understand the model formulation and priors.
+- Run the full example end-to-end and interpret posterior summaries.
+- Connect diagnostics to modeling decisions (priors, pooling, nonlinearity, link).
+
+**Model**
+
+$$
+y_i \sim \mathrm{Bernoulli}(\pi_i), \qquad \mathrm{logit}(\pi_i) = X_i^\top \beta.
+$$
+
+
+**Notes**
+- Interpret coefficients on the odds scale (odds ratios).
+- Discuss prior choices and separation issues.
+- For advanced notes, mention Polya–Gamma augmentation as an alternative Gibbs-friendly approach.
+
+## R JAGS Example
+
+```{r logit_inline, echo=TRUE, message=TRUE, warning=TRUE}
+#----------------------------- Bayesian logistic regression -----------------------------
+
+
+load(file=file.path(projpath,"spambase.RData"))
+table(spambase$is.spam)
+
+
+#Preprocessing data
+set.seed(1000)
+train_set = sample(1:nrow(spambase),1000)
+test_set = sample(setdiff(1:nrow(spambase),train_set),100)
+
+spambase_train = spambase[train_set,]
+spambase_test = spambase[test_set,]
+
+fit_glm = glm(is.spam~word.freq.free+word.freq.make,data=spambase_train,family=binomial())
+Y_glm_pred = as.numeric(predict(fit_glm,newdat=spambase_test)>0)
+
+rf_fit=randomForest::randomForest(x = spambase_train[,-1],y=as.factor(spambase_train[,1]))
+rf_pred = predict(rf_fit,newdata = spambase_test[,-1])
+
+
+Y_train = spambase_train$is.spam
+X_train = spambase_train[,c("word.freq.free","word.freq.make")]
+
+Y_test = spambase_test$is.spam
+X_test = spambase_test[,c("word.freq.free","word.freq.make")]
+
+tab = table(Y_glm_pred,Y_test)
+glm_acc = sum(diag(tab))/sum(tab)
+
+n = length(Y_train)
+n_pred = length(Y_test)
+
+JAGS_spam_model = function() {
+  # Likelihood
+  for (i in 1:n) {
+    Y_train[i] ~ dbern(prob[i])
+    prob[i] <- ilogit(beta_0 + inprod(X_train[i,],beta))
+  }
+  #prior
+  beta_0 ~ dnorm(0,0.1)
+
+  for(j in 1:p){
+    beta[j] ~ dnorm(0,10)
+  }
+  #prediction
+  for(i in 1:n_pred){
+    Y_pred[i] ~ dbern(pred_prob[i])
+    pred_prob[i] <- ilogit(beta_0 + inprod(X_test[i,],beta))
+  }
+
+}
+
+
+
+fit_JAGS_spam_model = jags(
+  data = list(Y_train = Y_train, n=n, X_train=as.matrix(X_train),
+              X_test = as.matrix(X_test),n_pred=n_pred,p=ncol(X_train)),
+  inits = list(list(Y_pred=rep(0,length=n_pred),beta_0 = 0)),
+  parameters.to.save = c("Y_pred"),
+  n.chains = 1,
+  n.iter = 10000,
+  n.burnin = 2000,
+  model.file = JAGS_spam_model
+)
+
+
+JAGS_spam_model_2 = function() {
+  # Likelihood
+  for (i in 1:n) {
+    Y_train[i] ~ dbern(prob[i])
+    prob[i] <- ilogit(beta_0 + inprod(X_train[i,],beta1) + inprod(X_train[i,]*X_train[i,],beta2))
+  }
+  #prior
+  beta_0 ~ dnorm(0,0.1)
+
+  for(j in 1:p){
+    beta1[j] ~ dnorm(0,0.1)
+    beta2[j] ~ dnorm(0,0.1)
+  }
+  #prediction
+  for(i in 1:n_pred){
+    Y_pred[i] ~ dbern(pred_prob[i])
+    pred_prob[i] <- ilogit(beta_0 + inprod(X_test[i,],beta1)+ inprod(X_test[i,]*X_test[i,],beta2))
+  }
+
+}
+
+
+
+fit_JAGS_spam_model_2 = jags(
+  data = list(Y_train = Y_train, n=n, X_train=as.matrix(X_train),
+              X_test = as.matrix(X_test),n_pred=n_pred,p=ncol(X_train)),
+  inits = list(list(Y_pred=rep(0,length=n_pred),beta_0 = 0)),
+  parameters.to.save = c("Y_pred"),
+  n.chains = 1,
+  n.iter = 10000,
+  n.burnin = 2000,
+  model.file = JAGS_spam_model_2
+)
+
+
+mcmc_fit <- as.mcmc(fit_JAGS_spam_model)
+nms <- paste("Y_pred[",1:n_pred,"]",sep="")
+pred_prob = apply(mcmc_fit[[1]][,nms],2,mean)
+Y_pred = as.numeric(pred_prob>0.5)
+tab=table(Y_pred,Y_test)
+Bayes_acc=sum(diag(tab))/sum(tab)
+
+mcmc_fit_2 <- as.mcmc(fit_JAGS_spam_model_2)
+pred_prob_2 = apply(mcmc_fit_2[[1]][,nms],2,mean)
+Y_pred_2 = as.numeric(pred_prob_2>0.5)
+tab_2=table(Y_pred_2,Y_test)
+Bayes_acc_2=sum(diag(tab_2))/sum(tab_2)
+
+acc_tab <- c(BayesLM = Bayes_acc,
+             BayesQR = Bayes_acc_2,
+             GLM = glm_acc,
+             RF = mean(rf_pred==Y_test))
+
+print(acc_tab)
+
+```
+
+

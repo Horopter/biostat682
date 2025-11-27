@@ -1,0 +1,26 @@
+[
+  {
+    "notebook": "swim_bayesian_pymc.ipynb",
+    "success": true,
+    "elapsed_seconds": 83.84693598747253,
+    "stdout": "",
+    "stderr": "[NbConvertApp] Converting notebook swim_bayesian_pymc.ipynb to notebook\n[NbConvertApp] Writing 2097433 bytes to swim_bayesian_pymc.ipynb\n",
+    "returncode": 0
+  },
+  {
+    "notebook": "UScrime_bayes.ipynb",
+    "success": true,
+    "elapsed_seconds": 209.82416081428528,
+    "stdout": "",
+    "stderr": "[NbConvertApp] Converting notebook UScrime_bayes.ipynb to notebook\n[NbConvertApp] Writing 846876 bytes to UScrime_bayes.ipynb\n",
+    "returncode": 0
+  },
+  {
+    "notebook": "gambia.ipynb",
+    "success": true,
+    "elapsed_seconds": 453.54428601264954,
+    "stdout": "",
+    "stderr": "[NbConvertApp] Converting notebook gambia.ipynb to notebook\n[NbConvertApp] Writing 1186248 bytes to gambia.ipynb\n",
+    "returncode": 0
+  }
+]

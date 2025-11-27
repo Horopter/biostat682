@@ -50,7 +50,7 @@ Thumbs.db
 *.log
 
 # Model files (too large for git)
-*.pkl
+# *.pkl  # Commented out - user wants to include pkl files
 *.h5
 *.hdf5
 *.model
@@ -72,9 +72,9 @@ Thumbs.db
 .env.local
 
 # Output files
-*.pdf
+# *.pdf  # Commented out - user wants to include PDF files
 *.html
-*.png
+# *.png  # Commented out - user wants to include PNG files
 *.jpg
 *.jpeg
 *.gif
